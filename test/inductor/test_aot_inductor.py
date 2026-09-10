@@ -6877,6 +6877,41 @@ class AOTInductorTestsTemplate:
         sys.platform not in ["linux", "win32"],
         "enable_kernel_profile only supported on linux and win32",
     )
+    def test_kernel_profile_scatter_fallback_arg_order(self):
+        # scatter_reduce keeps `dim` between its tensors:
+        #   (Tensor self, int dim, Tensor index, Tensor src, str reduce,
+        #    *, bool include_self)
+        # Its wrapper hook reorders the node's inputs and constants to reach
+        # that order, so the profiling record has to be built alongside the
+        # call rather than from the node's tensor inputs, which would report
+        # three tensors and no placeholders for a six-argument op.
+        class Model(torch.nn.Module):
+            def forward(self, inp, index, src):
+                # "prod" is not the reduction inductor can inline, so this
+                # lowers to the ATen fallback.
+                return torch.scatter_reduce(inp, 1, index, src, reduce="prod")
+
+        example_inputs = (
+            torch.randn(3, 5, device=self.device),
+            torch.tensor([[0, 1, 2, 0]], device=self.device, dtype=torch.int64),
+            torch.randn(2, 5, device=self.device),
+        )
+
+        with config.patch({"cpp.enable_kernel_profile": True}):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, Model(), example_inputs
+            )
+            self.assertEqual(
+                profiled_ivalue_kinds(code, r"aoti_torch_\w*scatter_reduce\w*"),
+                ["tensor", "scalar", "tensor", "tensor", "scalar", "scalar"],
+            )
+
+            self.check_model(Model(), example_inputs)
+
+    @unittest.skipIf(
+        sys.platform not in ["linux", "win32"],
+        "enable_kernel_profile only supported on linux and win32",
+    )
     def test_aoti_profiler_records_schema_arg_order(self):
         # index_reduce interleaves non-tensor and tensor arguments:
         #   (Tensor self, int dim, Tensor index, Tensor source, str reduce,
@@ -7009,6 +7044,161 @@ class AOTInductorTestsTemplate:
             # Conv on CUDA uses TF32, which differs from the fp32 reference by
             # ~1e-3; the profiling assertion above is this test's focus.
             self.check_model(Model(self.device), example_inputs, atol=1e-2, rtol=1e-2)
+
+    @unittest.skipIf(
+        sys.platform not in ["linux", "win32"],
+        "enable_kernel_profile only supported on linux and win32",
+    )
+    def test_kernel_profile_scatter_fallback(self):
+        # Scatter fallback kernels use a separate codegen path
+        # (_generate_scatter_fallback) that must also be wrapped in
+        # KernelContextGuard and RAIIAtenRecordFunctionHandle profiling
+        # blocks when profiling is enabled.  RAIIAtenRecordFunctionHandle
+        # is what actually creates the RecordFunction / External id linkage.
+        #
+        # "prod" is what forces the ATen fallback: use_scatter_fallback takes
+        # neither None nor the reduction inductor can inline.
+        class Model(torch.nn.Module):
+            def forward(self, inp, index, src):
+                return torch.scatter_reduce(inp, 1, index, src, reduce="prod")
+
+        example_inputs = (
+            torch.randn(3, 5, device=self.device),
+            torch.tensor([[0, 1, 2, 0]], device=self.device, dtype=torch.int64),
+            torch.randn(2, 5, device=self.device),
+        )
+
+        with config.patch(
+            {
+                "cpp.enable_kernel_profile": True,
+                "cpp.enable_kernel_context_guard": True,
+            }
+        ):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, Model(), example_inputs
+            )
+            # Anchored to the scatter kernel: both strings appear around every
+            # profiled kernel, so a bare FileCheck would pass without the
+            # fallback being wrapped at all.
+            scatter = re.search(
+                r"\{\s*KernelContextGuard[^\n]*\n(?:.*\n)*?\s*"
+                r'RAIIAtenRecordFunctionHandle \w+\("(aoti_torch_\w*scatter_reduce\w*)"',
+                code,
+            )
+            self.assertIsNotNone(scatter, "scatter fallback is not inside a guard")
+
+            self.check_model(Model(), example_inputs)
+
+    @unittest.skipIf(
+        sys.platform not in ["linux", "win32"],
+        "enable_kernel_profile only supported on linux and win32",
+    )
+    def test_kernel_profile_index_put_fallback(self):
+        # index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values,
+        #            bool accumulate). The index list arrives spread across the
+        # node's inputs and the wrapper hook flattens it, so the record is
+        # built alongside the call rather than derived from the node.
+        class Model(torch.nn.Module):
+            def forward(self, x, mask, values):
+                out = x.clone()
+                # A boolean index is what forces the ATen fallback, on either
+                # device.
+                out.index_put_((mask,), values, accumulate=True)
+                return out
+
+        example_inputs = (
+            torch.randn(4, 5, device=self.device),
+            torch.tensor([True, False, True, False], device=self.device),
+            torch.randn(5, device=self.device),
+        )
+
+        with config.patch({"cpp.enable_kernel_profile": True}):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, Model(), example_inputs
+            )
+            self.assertEqual(
+                profiled_ivalue_kinds(code, "aoti_torch_index_put_out"),
+                ["tensor", "tensor", "tensor", "scalar"],
+            )
+
+            self.check_model(Model(), example_inputs)
+
+    @unittest.skipIf(
+        sys.platform not in ["linux", "win32"],
+        "enable_kernel_profile only supported on linux and win32",
+    )
+    def test_kernel_profile_template_kernel(self):
+        # A max-autotune GEMM is emitted by codegen_template, which writes its
+        # own call line rather than going through the node schedule the
+        # ordinary kernels are wrapped from. Under max-autotune these carry
+        # most of the GPU time, so one left unwrapped costs the trace its
+        # kernel context exactly where it matters.
+        if IS_MACOS:
+            raise unittest.SkipTest("max_autotune not supported on macos")
+        on_gpu = self.device == GPU_TYPE
+        if on_gpu and not IS_BIG_GPU:
+            raise unittest.SkipTest("requires modern GPU to run max-autotune")
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # No bias, so the GEMM is the whole graph and the template
+                # kernel is the only kernel a guard could name.
+                self.linear = torch.nn.Linear(64, 64, bias=False)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        example_inputs = (torch.randn(32, 64, device=self.device),)
+        # ATEN is left out of the backend list so the GEMM has to lower to a
+        # template.
+        with config.patch(
+            {
+                "cpp.enable_kernel_profile": True,
+                "cpp.enable_kernel_context_guard": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON" if on_gpu else "CPP",
+            }
+        ):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, Model().to(self.device), example_inputs
+            )
+            guarded = set(re.findall(r'KernelContextGuard _ctx\("(\w+)"', code))
+            prefix = "triton_tem_" if on_gpu else "cpp_"
+            self.assertTrue(
+                any(name.startswith(prefix) for name in sorted(guarded)),
+                f"template kernel is not inside a guard; guarded: {sorted(guarded)}",
+            )
+
+            self.check_model(Model().to(self.device), example_inputs)
+
+    @unittest.skipIf(
+        sys.platform not in ["linux", "win32"],
+        "enable_kernel_profile only supported on linux and win32",
+    )
+    def test_kernel_profile_device_copy_records_destination(self):
+        # copy_(Tensor(a!) self, Tensor src, bool non_blocking). The
+        # destination is the node's own output rather than one of its inputs,
+        # so metadata derived from inputs alone would record src in self's
+        # place and drop the destination.
+        if self.device == "cpu":
+            raise unittest.SkipTest("device copy requires a non-cpu device")
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return x.to("cpu") + 1
+
+        example_inputs = (torch.randn(8, 8, device=self.device),)
+        with config.patch({"cpp.enable_kernel_profile": True}):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, Model(), example_inputs
+            )
+            self.assertEqual(
+                profiled_ivalue_kinds(code, "aoti_torch_copy_"),
+                ["tensor", "tensor", "scalar"],
+            )
+
+            self.check_model(Model(), example_inputs)
 
     def test_aoti_user_defined_triton_kernel_profiling(self):
         if self.device != GPU_TYPE or self.device == "mps":
