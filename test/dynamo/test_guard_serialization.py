@@ -1,5 +1,6 @@
 # Owner(s): ["module: dynamo"]
 
+import collections
 import dataclasses
 import functools
 import io
@@ -21,6 +22,7 @@ import torch._inductor.test_case
 import torch.fx.graph as fx_graph
 import torch.onnx.operators
 import torch.utils.cpp_extension
+from torch._C._dynamo.eval_frame import _debug_get_precompile_entries
 from torch._dynamo.bytecode_transformation import transform_code_object
 from torch._dynamo.exc import PackageError
 from torch._dynamo.guards import (
@@ -29,7 +31,8 @@ from torch._dynamo.guards import (
     CompileId,
     GuardsStatePickler,
 )
-from torch._dynamo.package import CompilePackage
+from torch._dynamo.package import CompilePackage, DynamoCache
+from torch._dynamo.precompile_context import PrecompileContext
 from torch._dynamo.source import LocalSource
 from torch._dynamo.symbolic_convert import (
     ExceptionStack,
@@ -462,6 +465,112 @@ class GuardedDefaultsTupleModule(torch.nn.Module):
         if self.fn.__defaults__ == (2.0, 1.0) and self.fn.__kwdefaults__ == {"c": 3.0}:
             x = x + 1
         return x + 2
+
+
+def keep_dict_attribute(func):
+    func.tag = 2.0
+    func.cache = threading.Lock()  # unpicklable and unguarded
+
+    @functools.wraps(func)
+    def wrapper(self, x):
+        if func.__dict__["tag"] == 2.0:
+            x = x + 1
+        return func(self, x)
+
+    return wrapper
+
+
+class DecoratedDictAttributeForwardModule(torch.nn.Module):
+    @keep_dict_attribute
+    def forward(self, x):
+        return x * 2
+
+
+def keep_whole_dict_attribute(func):
+    func.tag = 2.0
+    func.cache = threading.Lock()  # unpicklable and unguarded sibling
+
+    @functools.wraps(func)
+    def wrapper(self, x):
+        # type(func.__dict__) installs a TYPE_MATCH on the mapping, registering
+        # it, and func.tag guards one attribute; no guard reads the dict's
+        # values, so it is pruned per value and func.cache is dropped.
+        if type(func.__dict__) is dict and func.tag == 2.0:
+            x = x + 1
+        return func(self, x)
+
+    return wrapper
+
+
+class DecoratedWholeDictAttributeForwardModule(torch.nn.Module):
+    @keep_whole_dict_attribute
+    def forward(self, x):
+        return x * 2
+
+
+def keep_defaults_element(func):
+    @functools.wraps(func)
+    def wrapper(self, x):
+        if func.__defaults__[0] == 2.0:
+            x = x + 1
+        return func(self, x)
+
+    return wrapper
+
+
+class DecoratedDefaultsElementForwardModule(torch.nn.Module):
+    @keep_defaults_element
+    def forward(self, x, scale=2.0, junk=threading.Lock()):  # unpicklable sibling
+        return x * scale
+
+
+class DecoratedCalledDefaultForwardModule(torch.nn.Module):
+    # keep_attribute roots the guard at the function via scale_flag (not through
+    # __defaults__). The tuple is pulled in only by the call-site default binding
+    # of `scale` -- the ordinary DefaultsSource shape whose base is the function,
+    # not the tuple.
+    @keep_attribute
+    def forward(self, x, scale=2.0, junk=threading.Lock()):  # unpicklable sibling
+        return x * scale
+
+
+def _whole_defaults_base(x, scale=2.0, shape=(1, 2)):
+    return x * scale
+
+
+@functools.wraps(_whole_defaults_base)
+def whole_defaults_wrapper(x, scale=2.0, shape=(1, 2)):
+    return _whole_defaults_base(x, scale, shape)
+
+
+class WholeDefaultsEqualsModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.impl = whole_defaults_wrapper
+
+    def forward(self, x):
+        # A whole-tuple EQUALS_MATCH on __defaults__ next to the call-site
+        # default binding: only the value guard says the tuple must stay whole,
+        # and the nested tuple is not a scalar the pruner would carry anyway.
+        if self.impl.__defaults__ == (2.0, (1, 2)):
+            x = x + 1
+        return self.impl(x)
+
+
+def keep_none_default(func):
+    @functools.wraps(func)
+    def wrapper(self, x):
+        if func.__defaults__[0] is None:
+            x = x + 1
+        return func(self, x)
+
+    return wrapper
+
+
+class DecoratedNoneDefaultForwardModule(torch.nn.Module):
+    @keep_none_default
+    def forward(self, x, cfg=None, junk=threading.Lock()):  # guarded slot is None
+        return x * 2
 
 
 # A module-level lambda's qualname is "<lambda>", which resolves to nothing.
@@ -1051,6 +1160,57 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         self.assertEqual(set(out.__dict__), {"tag", "cache"})
         self.assertEqual(out.__dict__["tag"], 2.0)
         self.assertIsInstance(out.__dict__["cache"], _Missing)
+
+    def test_a_whole_tuple_guard_keeps_defaults_verbatim(self):
+        # An EQUALS_MATCH on the __defaults__ tuple rebakes its constant from the
+        # rebuilt function at load, so the tuple comes back whole even though an
+        # unguarded sibling sits beside a guarded element (a call-site default
+        # binding next to `f.__defaults__ == (...)` is ordinary code).
+        def base(x, a=Inputs(1, 2), b=Inputs(3, 4)):
+            return x
+
+        d = base.__defaults__
+        gtv = {id(base): base, id(d): d, id(d[1]): d[1]}
+        buf = io.BytesIO()
+        pickler = GuardsStatePickler(
+            gtv, {}, {}, buf, value_guarded_containers={id(d): d}
+        )
+        pickler.dump({"fn": base})
+        out = pickle.loads(buf.getvalue())["fn"]
+        self.assertIsInstance(out.__defaults__[0], Inputs)
+        self.assertIsInstance(out.__defaults__[1], Inputs)
+
+    def test_a_length_guarded_tuple_is_pruned_per_value(self):
+        # A tuple registered without a value guard (what bind_args installs on
+        # __defaults__ for any called function with a positional default) is
+        # pruned per value: its unguarded elements are dropped, the guarded one
+        # and the length survive.
+        def base(x, a=Inputs(1, 2), b=Inputs(3, 4)):
+            return x
+
+        d = base.__defaults__
+        gtv = {id(base): base, id(d): d, id(d[1]): d[1]}
+        buf = io.BytesIO()
+        GuardsStatePickler(gtv, {}, {}, buf).dump({"fn": base})
+        out = pickle.loads(buf.getvalue())["fn"]
+        self.assertIsInstance(out.__defaults__[0], _Missing)
+        self.assertIsInstance(out.__defaults__[1], Inputs)
+
+    def test_a_container_subclass_stays_verbatim(self):
+        # A dict/tuple subclass is carried whole whenever it is kept: its type
+        # must survive for the guard reading the slot, so its values are not
+        # pruned either.
+        def base(x, *, a=Inputs(1, 2), b=Inputs(3, 4)):
+            return x
+
+        base.__kwdefaults__ = collections.OrderedDict(base.__kwdefaults__)
+        kw = base.__kwdefaults__
+        gtv = {id(base): base, id(kw): kw, id(kw["b"]): kw["b"]}
+        buf = io.BytesIO()
+        GuardsStatePickler(gtv, {}, {}, buf).dump({"fn": base})
+        out = pickle.loads(buf.getvalue())["fn"]
+        self.assertIs(type(out.__kwdefaults__), collections.OrderedDict)
+        self.assertIsInstance(out.__kwdefaults__["a"], Inputs)
 
     def test_fqn_mismatched_function_keeps_a_shared_closure_cell_shared(self):
         # Two functions closing over one variable must still share the cell
@@ -1733,6 +1893,107 @@ class TestGuardSerialization(TestGuardSerializationBase):
         mod.fn.__defaults__ = (2.0, 1.0)
         mod.fn.__kwdefaults__ = {"c": 4.0}
         self._test_check_fn(ref, loaded, {"self": mod, "x": torch.randn(3)}, False)
+
+    def test_fqn_mismatched_function_prunes_unpicklable_dict_attributes(self):
+        # A guard through __dict__ registers the dict itself, which used to be
+        # carried verbatim: one unpicklable unguarded attribute then bypassed
+        # the whole package. The guarded attribute must still round-trip.
+        mod = DecoratedDictAttributeForwardModule()
+        ref, loaded = self._test_serialization("EQUALS_MATCH", mod, torch.randn(3))
+        inner = type(mod).forward.__wrapped__
+        inputs = {"self": mod, "x": torch.randn(3), "func": inner}
+        self._test_check_fn(ref, loaded, inputs, True)
+        inner.tag = 3.0
+        try:
+            self._test_check_fn(ref, loaded, inputs, False)
+        finally:
+            inner.tag = 2.0
+
+    def test_fqn_mismatched_function_prunes_unpicklable_defaults(self):
+        # A guard through __defaults__[0] registers the tuple itself. Carrying
+        # it verbatim would drag the unpicklable unguarded sibling default into
+        # the pickle; pruning per value keeps the guarded slot and drops the
+        # sibling. The guarded default must still round-trip.
+        mod = DecoratedDefaultsElementForwardModule()
+        ref, loaded = self._test_serialization("EQUALS_MATCH", mod, torch.randn(3))
+        inner = type(mod).forward.__wrapped__
+        inputs = {"self": mod, "x": torch.randn(3), "func": inner}
+        self._test_check_fn(ref, loaded, inputs, True)
+        original = inner.__defaults__
+        inner.__defaults__ = (3.0, original[1])
+        try:
+            self._test_check_fn(ref, loaded, inputs, False)
+        finally:
+            inner.__defaults__ = original
+
+    def _roundtrip_through_precompile(self, mod):
+        # _test_serialization's guard filter drops the whole-container guards
+        # (bind_args' SEQUENCE_LENGTH on __defaults__, TYPE_MATCH on __dict__)
+        # that decide whether a container is kept, so these shapes need the full
+        # compile path: compile, save the package, reload it in a fresh dynamo
+        # state and require a hit. strict_precompile (on for this class) turns
+        # any bypass into an error.
+        x = torch.randn(3)
+        expected = mod(x)
+        torch._dynamo.reset()
+        DynamoCache.clear()
+        PrecompileContext.clear()
+        compiled = torch.compile(mod)  # noqa: UNSPECIFIED_BACKEND
+        self.assertEqual(compiled(x), expected)
+        (entry,) = PrecompileContext.save_to_dynamo_cache()["dynamo"]
+        self.assertTrue(entry["backend_ids"])
+        torch._dynamo.reset()
+        PrecompileContext.clear()
+        compiled = torch.compile(mod)  # noqa: UNSPECIFIED_BACKEND
+        code = type(mod).forward.__code__
+        self.assertEqual(len(_debug_get_precompile_entries(code)), 1)
+        with torch.compiler.set_stance("fail_on_recompile"):
+            self.assertEqual(compiled(x), expected)
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_fqn_mismatched_function_prunes_an_unpicklable_called_default(self):
+        # The call-site default binding registers the __defaults__ tuple through
+        # bind_args' SEQUENCE_LENGTH; no guard reads its values, so the tuple is
+        # pruned per value and the unpicklable sibling default is dropped.
+        self._roundtrip_through_precompile(DecoratedCalledDefaultForwardModule())
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_fqn_mismatched_function_prunes_an_unread_unpicklable_default(self):
+        # Same registration, but the guard is rooted at the function's __name__
+        # and no default is ever read: the tuple is kept by the length guard
+        # alone and must still prune its unpicklable element.
+        self._roundtrip_through_precompile(DecoratedUnpicklableDefaultForwardModule())
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_fqn_mismatched_function_prunes_a_type_guarded_dict(self):
+        # A TYPE_MATCH on the whole __dict__ registers the mapping and an
+        # attribute guard reads one element; no guard reads the dict's values,
+        # so it is pruned per value and the unpicklable sibling (func.cache) is
+        # dropped.
+        self._roundtrip_through_precompile(DecoratedWholeDictAttributeForwardModule())
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_whole_defaults_equals_match_survives_a_called_default(self):
+        # An EQUALS_MATCH on the whole __defaults__ tuple next to the call-site
+        # binding of one default: pruning the unguarded nested tuple would rebake
+        # the equality against a sentinel and miss forever after reload.
+        self._roundtrip_through_precompile(WholeDefaultsEqualsModule())
+
+    def test_fqn_mismatched_function_prunes_a_none_valued_guarded_default(self):
+        # No EQUALS_MATCH reads the tuple whole, so it is pruned per value: the
+        # None the guard is rooted at is a literal and stays, the unpicklable
+        # sibling is dropped, on this ordinary `cfg=None` shape.
+        mod = DecoratedNoneDefaultForwardModule()
+        ref, loaded = self._test_serialization("CONSTANT_MATCH", mod, torch.randn(3))
+        inner = type(mod).forward.__wrapped__
+        inputs = {"self": mod, "x": torch.randn(3), "func": inner}
+        self._test_check_fn(ref, loaded, inputs, True)
+        original = inner.__defaults__
+        inner.__defaults__ = (3.0, original[1])
+        try:
+            self._test_check_fn(ref, loaded, inputs, False)
+        finally:
+            inner.__defaults__ = original
 
     def test_guard_rooted_at_a_lambda(self):
         # A module-level lambda is an fqn mismatch too (see GLOBAL_LAMBDA) and
