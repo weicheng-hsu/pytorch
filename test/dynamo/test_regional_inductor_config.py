@@ -26,6 +26,62 @@ class NestedRegionInductorConfigTests(torch._inductor.test_case.TestCase):
         graph.output(())
         return torch.fx.GraphModule({}, graph)
 
+    @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+    @torch._inductor.config.patch(
+        fx_graph_cache=False,
+        fx_graph_remote_cache=False,
+    )
+    @parametrize("parent_max_autotune", (False, True))
+    @parametrize("nested_max_autotune", (False, True))
+    def test_nested_region_inductor_config_max_autotune(
+        self, parent_max_autotune, nested_max_autotune
+    ):
+        from torch._inductor.utils import add_scheduler_init_hook
+        from torch._inductor.virtualized import V
+
+        nested_config = get_invoke_subgraph_compile_options(
+            fw_inductor_config_patches={"max_autotune": nested_max_autotune}
+        )
+
+        @torch.compiler.nested_compile_region(options=nested_config)
+        def g(x):
+            return torch.sin(x) + 1
+
+        def fn(x):
+            return g(torch.cos(x)) * 2
+
+        scheduler_max_autotune = []
+
+        def record_max_autotune(_scheduler, _nodes):
+            scheduler_max_autotune.append(
+                (V.graph.name, torch._inductor.config.max_autotune)
+            )
+
+        with (
+            add_scheduler_init_hook(record_max_autotune),
+            torch._inductor.config.patch(max_autotune=parent_max_autotune),
+        ):
+            x = torch.randn(10)
+            result = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+
+        self.assertEqual(result, fn(x))
+        self.assertEqual(
+            [
+                max_autotune
+                for name, max_autotune in scheduler_max_autotune
+                if name is None
+            ],
+            [parent_max_autotune],
+        )
+        self.assertEqual(
+            [
+                max_autotune
+                for name, max_autotune in scheduler_max_autotune
+                if name is not None
+            ],
+            [nested_max_autotune],
+        )
+
     def test_invalid_inductor_config(self):
         """Test that invalid inductor config keys are caught with a clear error."""
 
