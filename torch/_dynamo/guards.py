@@ -1722,6 +1722,17 @@ class GuardBuilder(GuardBuilderBase):
         if source_name != "":
             example_value = self.get(source)
             self.guard_tree_values[id(example_value)] = example_value
+            # A guard rooted at a bound method reads through method.__func__,
+            # which _reduce_bound_method carries explicitly, so the function must
+            # be registered before pickle can reach it: an unseeded fqn-mismatched
+            # func reduces to _Missing and the load AttributeErrors on it. Every
+            # method a guard is rooted at passes here before anything is pickled,
+            # so this one seed suffices. The serializer is the only reader, hence
+            # the save_guards gate; the registration above is unconditional only
+            # because it predates that flag.
+            if self.save_guards and inspect.ismethod(example_value):
+                func = example_value.__func__
+                self.guard_tree_values[id(func)] = func
 
         guard_manager_enum = self.get_guard_manager_type(source, example_value)
 
