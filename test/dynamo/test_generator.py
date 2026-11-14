@@ -2296,6 +2296,31 @@ class TestGeneratorCoroutine(GeneratorTestsBase):
         with self.assertRaisesRegex(Unsupported, "generator frame attribute"):
             torch.compile(f_trace, backend="eager", fullgraph=True)()
 
+    def test_gi_frame_f_locals_unmodeled_graph_break(self):
+        def gen(it):
+            for x in it:
+                yield x
+
+        def cell_gen(it):
+            def inner():
+                return it
+
+            yield from inner()
+
+        def delete():
+            del gen(range(3)).gi_frame.f_locals["it"]
+
+        def not_a_local():
+            gen(range(3)).gi_frame.f_locals["y"] = 1
+
+        def cell_var():
+            cell_gen(range(3)).gi_frame.f_locals["it"] = [1]
+
+        for fn in (delete, not_a_local, cell_var):
+            with self.subTest(fn=fn.__name__):
+                with self.assertRaisesRegex(Unsupported, "generator frame f_locals"):
+                    torch.compile(fn, backend="eager", fullgraph=True)()
+
     @make_dynamo_test
     def test_generator_exit_not_caught_by_except_exception(self):
         log = []
